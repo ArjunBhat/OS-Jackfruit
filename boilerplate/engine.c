@@ -371,7 +371,6 @@ static container_t *find_container_by_pid_locked(pid_t pid)
 static int parse_start_tokens(char **tokens, int ntok, start_request_t *out)
 {
     int i;
-    int command_started = 0;
 
     if (ntok < 4) {
         return -1;
@@ -384,7 +383,7 @@ static int parse_start_tokens(char **tokens, int ntok, start_request_t *out)
     out->hard_mib = DEFAULT_HARD_MIB;
 
     for (i = 3; i < ntok; i++) {
-        if (!command_started && strcmp(tokens[i], "--soft-mib") == 0) {
+        if (strcmp(tokens[i], "--soft-mib") == 0) {
             if (i + 1 >= ntok) {
                 free_start_request(out);
                 return -1;
@@ -392,7 +391,7 @@ static int parse_start_tokens(char **tokens, int ntok, start_request_t *out)
             out->soft_mib = atoi(tokens[++i]);
             continue;
         }
-        if (!command_started && strcmp(tokens[i], "--hard-mib") == 0) {
+        if (strcmp(tokens[i], "--hard-mib") == 0) {
             if (i + 1 >= ntok) {
                 free_start_request(out);
                 return -1;
@@ -400,7 +399,7 @@ static int parse_start_tokens(char **tokens, int ntok, start_request_t *out)
             out->hard_mib = atoi(tokens[++i]);
             continue;
         }
-        if (!command_started && strcmp(tokens[i], "--nice") == 0) {
+        if (strcmp(tokens[i], "--nice") == 0) {
             if (i + 1 >= ntok) {
                 free_start_request(out);
                 return -1;
@@ -410,7 +409,6 @@ static int parse_start_tokens(char **tokens, int ntok, start_request_t *out)
             continue;
         }
 
-        command_started = 1;
         if (out->argc >= MAX_CMD_ARGS - 1) {
             free_start_request(out);
             return -1;
@@ -593,6 +591,7 @@ static int request_stop(container_t *c)
         return 0;
     }
     c->stop_requested = 1;
+    c->reason = REASON_MANUALLY_STOPPED;
     pthread_mutex_unlock(&c->lock);
 
     if (kill(c->pid, SIGTERM) != 0 && errno != ESRCH) {
@@ -770,13 +769,16 @@ static int start_container(const start_request_t *req, container_t **out)
 
 static void mark_container_exit(container_t *c, int status)
 {
+    int stop_requested;
+
     pthread_mutex_lock(&c->lock);
+    stop_requested = c->stop_requested;
     c->state = CONTAINER_EXITED;
 
     if (WIFEXITED(status)) {
         c->exit_code = WEXITSTATUS(status);
         c->final_status = c->exit_code;
-        if (c->stop_requested) {
+        if (stop_requested) {
             c->reason = REASON_MANUALLY_STOPPED;
         } else {
             c->reason = REASON_NORMAL_EXIT;
@@ -785,7 +787,7 @@ static void mark_container_exit(container_t *c, int status)
         int sig = WTERMSIG(status);
         c->term_signal = sig;
         c->final_status = 128 + sig;
-        if (c->stop_requested) {
+        if (stop_requested) {
             c->reason = REASON_MANUALLY_STOPPED;
         } else if (sig == SIGKILL) {
             c->reason = REASON_HARD_LIMIT_KILLED;
@@ -875,11 +877,14 @@ static void handle_ps(int client_fd)
     cur = g_containers;
     while (cur != NULL) {
         char line[2048];
+        char nice_buf[16];
         long ts = 0;
         char tbuf[64] = "-";
         int exit_code;
         int term_signal;
         int stop_requested;
+        int has_nice;
+        int nice_value;
         container_state_t state;
         final_reason_t reason;
 
@@ -887,10 +892,18 @@ static void handle_ps(int client_fd)
         exit_code = cur->exit_code;
         term_signal = cur->term_signal;
         stop_requested = cur->stop_requested;
+        has_nice = cur->has_nice;
+        nice_value = cur->nice_value;
         state = cur->state;
         reason = cur->reason;
         ts = (long)cur->start_time;
         pthread_mutex_unlock(&cur->lock);
+
+        if (has_nice) {
+            snprintf(nice_buf, sizeof(nice_buf), "%d", nice_value);
+        } else {
+            snprintf(nice_buf, sizeof(nice_buf), "-");
+        }
 
         localtime_r(&cur->start_time, &tmv);
         strftime(tbuf, sizeof(tbuf), "%Y-%m-%dT%H:%M:%S", &tmv);
@@ -904,7 +917,7 @@ static void handle_ps(int client_fd)
                  reason_to_string(reason),
                  cur->soft_mib,
                  cur->hard_mib,
-                 cur->has_nice ? "set" : "-",
+                 nice_buf,
                  ts ? tbuf : "-",
                  exit_code,
                  term_signal,
@@ -1294,6 +1307,65 @@ static int send_simple_client_command(int argc, char **argv)
     return 0;
 }
 
+static int send_start_client_command(int argc, char **argv)
+{
+    int fd;
+    char req[REQ_MAX];
+    char ch;
+    char response[512];
+    size_t used = 0;
+    int i;
+
+    fd = connect_supervisor_socket();
+    if (fd < 0) {
+        perror("connect");
+        return 1;
+    }
+
+    req[0] = '\0';
+    for (i = 1; i < argc; i++) {
+        if (strlen(req) + strlen(argv[i]) + 2 >= sizeof(req)) {
+            close(fd);
+            return 1;
+        }
+        strcat(req, argv[i]);
+        if (i + 1 < argc) {
+            strcat(req, " ");
+        }
+    }
+
+    if (safe_write_all(fd, req, strlen(req)) != 0) {
+        close(fd);
+        return 1;
+    }
+
+    memset(response, 0, sizeof(response));
+    while (used < sizeof(response) - 1) {
+        ssize_t n = read(fd, &ch, 1);
+        if (n == 0) {
+            break;
+        }
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            close(fd);
+            return 1;
+        }
+        response[used++] = ch;
+        if (ch == '\n') {
+            break;
+        }
+    }
+
+    if (used > 0) {
+        (void)safe_write_all(STDOUT_FILENO, response, used);
+    }
+
+    close(fd);
+    return 0;
+}
+
 static int run_supervisor(const char *base_rootfs)
 {
     struct sockaddr_un addr;
@@ -1471,7 +1543,7 @@ int main(int argc, char **argv)
             usage(argv[0]);
             return 1;
         }
-        return send_simple_client_command(argc, argv);
+        return send_start_client_command(argc, argv);
     }
     if (strcmp(argv[1], "run") == 0) {
         return run_client_command(argc, argv);

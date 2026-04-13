@@ -11,6 +11,7 @@
  * YOUR WORK: Fill in all sections marked // TODO.
  */
 
+#include <linux/jiffies.h>
 #include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/fs.h>
@@ -61,6 +62,17 @@ struct monitored_entry {
  * ============================================================== */
 static LIST_HEAD(monitored_list);
 static DEFINE_MUTEX(monitored_lock);
+static unsigned long monitor_ticks;
+
+static int monitored_count_locked(void)
+{
+    int count = 0;
+    struct monitored_entry *entry;
+
+    list_for_each_entry(entry, &monitored_list, link)
+        count++;
+    return count;
+}
 
 
 /* --- Provided: internal device / timer state --- */
@@ -145,6 +157,8 @@ static void timer_callback(struct timer_list *t)
 {
     struct monitored_entry *entry, *tmp;
 
+    (void)t;
+
     /* ==============================================================
      * TODO 3: Implement periodic monitoring.
      *
@@ -156,10 +170,20 @@ static void timer_callback(struct timer_list *t)
      *   - avoid use-after-free while deleting during iteration
      * ============================================================== */
     mutex_lock(&monitored_lock);
+    monitor_ticks++;
+    if ((monitor_ticks % 5) == 0)
+        printk(KERN_INFO "[container_monitor] timer tick=%lu tracked=%d\n",
+               monitor_ticks,
+               monitored_count_locked());
+
     list_for_each_entry_safe(entry, tmp, &monitored_list, link) {
         long rss_bytes = get_rss_bytes(entry->pid);
 
         if (rss_bytes < 0) {
+            printk(KERN_INFO
+                   "[container_monitor] Removing stale entry container=%s pid=%d\n",
+                   entry->container_id,
+                   entry->pid);
             list_del(&entry->link);
             kfree(entry);
             continue;
@@ -181,6 +205,10 @@ static void timer_callback(struct timer_list *t)
                          entry->pid,
                          entry->hard_limit_bytes,
                          rss_bytes);
+            printk(KERN_INFO
+                   "[container_monitor] Removing hard-limit entry container=%s pid=%d\n",
+                   entry->container_id,
+                   entry->pid);
             list_del(&entry->link);
             kfree(entry);
         }
@@ -211,6 +239,7 @@ static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 
     if (cmd == MONITOR_REGISTER) {
         struct monitored_entry *entry;
+        struct monitored_entry *it;
 
         printk(KERN_INFO
                "[container_monitor] Registering container=%s pid=%d soft=%lu hard=%lu\n",
@@ -238,10 +267,27 @@ static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         entry->soft_limit_bytes = req.soft_limit_bytes;
         entry->hard_limit_bytes = req.hard_limit_bytes;
         entry->soft_warned = false;
-        strscpy(entry->container_id, req.container_id, sizeof(entry->container_id));
+        strncpy(entry->container_id, req.container_id, sizeof(entry->container_id) - 1);
+        entry->container_id[sizeof(entry->container_id) - 1] = '\0';
 
         mutex_lock(&monitored_lock);
+        list_for_each_entry(it, &monitored_list, link) {
+            if (it->pid == entry->pid) {
+                printk(KERN_INFO
+                       "[container_monitor] Replacing existing entry container=%s pid=%d\n",
+                       it->container_id,
+                       it->pid);
+                list_del(&it->link);
+                kfree(it);
+                break;
+            }
+        }
         list_add_tail(&entry->link, &monitored_list);
+        printk(KERN_INFO
+               "[container_monitor] Added entry container=%s pid=%d tracked=%d\n",
+               entry->container_id,
+               entry->pid,
+               monitored_count_locked());
         mutex_unlock(&monitored_lock);
 
         return 0;
@@ -269,6 +315,10 @@ static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
                  strncmp(entry->container_id,
                          req.container_id,
                          sizeof(entry->container_id)) == 0)) {
+                printk(KERN_INFO
+                       "[container_monitor] Removed entry container=%s pid=%d\n",
+                       entry->container_id,
+                       entry->pid);
                 list_del(&entry->link);
                 kfree(entry);
                 mutex_unlock(&monitored_lock);
@@ -320,7 +370,10 @@ static int __init monitor_init(void)
     timer_setup(&monitor_timer, timer_callback, 0);
     mod_timer(&monitor_timer, jiffies + CHECK_INTERVAL_SEC * HZ);
 
-    printk(KERN_INFO "[container_monitor] Module loaded. Device: /dev/%s\n", DEVICE_NAME);
+    printk(KERN_INFO
+           "[container_monitor] Module loaded. Device: /dev/%s interval=%ds\n",
+           DEVICE_NAME,
+           CHECK_INTERVAL_SEC);
     return 0;
 }
 
@@ -329,7 +382,7 @@ static void __exit monitor_exit(void)
 {
     struct monitored_entry *entry, *tmp;
 
-    del_timer_sync(&monitor_timer);
+    timer_delete_sync(&monitor_timer);
 
     /* ==============================================================
      * TODO 6: Free all remaining monitored entries.
@@ -341,6 +394,10 @@ static void __exit monitor_exit(void)
 
     mutex_lock(&monitored_lock);
     list_for_each_entry_safe(entry, tmp, &monitored_list, link) {
+        printk(KERN_INFO
+               "[container_monitor] Freeing entry on unload container=%s pid=%d\n",
+               entry->container_id,
+               entry->pid);
         list_del(&entry->link);
         kfree(entry);
     }
