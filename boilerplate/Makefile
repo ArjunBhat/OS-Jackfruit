@@ -36,6 +36,6 @@ clean:
 	rm -f $(USER_TARGETS) *.o *.mod *.mod.c *.symvers *.order
 	rm -f *.log
 	rm -rf logs
-	rm -f /tmp/mini_runtime.sock
+	rm -f /tmp/mini_runtime.sock /tmp/jackfruit.sock
 
 .PHONY: all ci module clean

@@ -1,21 +1,16 @@
 #ifndef MONITOR_IOCTL_H
 #define MONITOR_IOCTL_H
 
-#ifdef __KERNEL__
 #include <linux/ioctl.h>
-#include <linux/types.h>
-#else
-#include <sys/ioctl.h>
-#include <sys/types.h>
-#endif
 
-#define MONITOR_NAME_LEN 32
+#define CONTAINER_ID_MAX 64
 
+/* Shared request packet between runtime and kernel module. */
 struct monitor_request {
-    pid_t pid;
+    int pid;
     unsigned long soft_limit_bytes;
     unsigned long hard_limit_bytes;
-    char container_id[MONITOR_NAME_LEN];
+    char container_id[CONTAINER_ID_MAX];
 };
 
 #define MONITOR_MAGIC 'M'
