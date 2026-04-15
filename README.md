@@ -157,7 +157,7 @@ Defaults:
 
 ### Multi-container supervision
 
-![Multi-container supervision](screenshots/multicontainer.png)
+![Multi-container supervision](screenshots/supervision.png)
 
 Shows supervisor managing multiple containers simultaneously via `engine ps`.
 
